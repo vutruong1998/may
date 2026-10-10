@@ -1,0 +1,7 @@
+/may
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate*
+__pycache__/
+.pytest_cache/
+PLAN.md
