@@ -23,6 +23,9 @@ type Service interface {
 type Router struct {
 	Version string
 	Log     bool
+	// Changed, if set, is called after each request that may have changed
+	// state (anything but GET, HEAD and OPTIONS).
+	Changed func()
 
 	services map[string]Service // by SigV4 signing name
 	actions  map[string]string  // query action -> service, for unsigned requests
@@ -124,6 +127,9 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			rt.unsupported(w, r, svc)
 		}
+	}
+	if rt.Changed != nil && r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+		rt.Changed()
 	}
 	if rt.Log {
 		log.Printf("%-4s %3d %-4s %s %s (%s)", svc, rec.status, r.Method, r.URL.Path, actionOf(r), time.Since(start).Round(time.Microsecond))

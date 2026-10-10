@@ -29,12 +29,15 @@ import (
 //   - master password changes run ALTER USER inside the container, and
 //     class changes update the container's CPU and memory limits.
 //
-// Containers and volumes are removed when the instance is deleted, on
-// reset and when may exits, since may keeps no state across restarts.
+// Containers and volumes are removed when the instance is deleted and on
+// reset. When may exits they are removed too, unless keep (-data-dir) is
+// set: then containers are stopped, and Resume takes them over on the next
+// start.
 type DockerDriver struct {
 	s       *Service
 	dc      *docker.Client
 	mayPort int
+	keep    bool
 	region  string // instances in other regions get the region in their container name
 
 	mu    sync.Mutex
@@ -57,11 +60,14 @@ const (
 	readyTimeout  = 5 * time.Minute
 )
 
-// NewDockerDriver removes containers and volumes left over from an earlier
-// run.
-func NewDockerDriver(s *Service, dc *docker.Client, mayPort int, region string) *DockerDriver {
-	d := &DockerDriver{s: s, dc: dc, mayPort: mayPort, region: region, boxes: map[string]*dbBox{}, pulls: map[string]*sync.Mutex{}}
-	d.cleanup()
+// NewDockerDriver connects the driver. Without keep it removes containers
+// and volumes left over from an earlier run; with keep, Resume takes them
+// over.
+func NewDockerDriver(s *Service, dc *docker.Client, mayPort int, region string, keep bool) *DockerDriver {
+	d := &DockerDriver{s: s, dc: dc, mayPort: mayPort, region: region, keep: keep, boxes: map[string]*dbBox{}, pulls: map[string]*sync.Mutex{}}
+	if !keep {
+		d.cleanup()
+	}
 	return d
 }
 
@@ -82,8 +88,78 @@ func (d *DockerDriver) cleanup() {
 	}
 }
 
-// Close removes every database container and volume (on shutdown).
-func (d *DockerDriver) Close() { d.cleanup() }
+// Close runs on shutdown: it removes every database container and volume,
+// or with keep, stops the containers.
+func (d *DockerDriver) Close() {
+	if !d.keep {
+		d.cleanup()
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*dbStopTimeout)
+	defer cancel()
+	cs, _ := d.dc.Containers(ctx, d.label())
+	var wg sync.WaitGroup
+	for _, c := range cs {
+		if c.State != "running" {
+			continue
+		}
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			_ = d.dc.Stop(ctx, id, dbStopTimeout)
+		}(c.ID)
+	}
+	wg.Wait()
+}
+
+// Resume takes over the instances loaded from -data-dir: each gets its
+// container and volume back, and those with run set start (with a new
+// container on the same volume if theirs is gone). Containers and volumes
+// of other instances are removed.
+func (d *DockerDriver) Resume(specs []*Spec, run []bool) {
+	ctx := context.Background()
+	containers := map[string]string{} // DbiResourceId -> container ID
+	cs, err := d.dc.Containers(ctx, d.label())
+	if err != nil {
+		log.Printf("rds: listing containers to resume: %v", err)
+	}
+	for _, c := range cs {
+		containers[c.Labels["may.dbi-resource-id"]] = c.ID
+	}
+	volumes := map[string]bool{}
+	for i, spec := range specs {
+		b := &dbBox{spec: spec, name: d.containerName(spec.Region, spec.Identifier),
+			volume: "may-rds-" + strings.ToLower(spec.Key), container: containers[spec.Key], rootPass: spec.MasterPassword}
+		delete(containers, spec.Key)
+		volumes[b.volume] = true
+		if spec.Engine != "postgres" && spec.MasterUser != "root" && b.container != "" {
+			// The generated root password is only in the container's environment.
+			if in, err := d.dc.Inspect(ctx, b.container); err == nil {
+				for _, e := range in.Config.Env {
+					if k, v, _ := strings.Cut(e, "="); strings.HasSuffix(k, "_ROOT_PASSWORD") {
+						b.rootPass = v
+					}
+				}
+			}
+		}
+		d.mu.Lock()
+		d.boxes[spec.Key] = b
+		d.mu.Unlock()
+		if run[i] {
+			d.logf(spec, "resuming container %s", b.name)
+			d.Start(spec)
+		}
+	}
+	for _, cid := range containers {
+		_ = d.dc.Remove(ctx, cid)
+	}
+	vs, _ := d.dc.Volumes(ctx, d.label())
+	for _, v := range vs {
+		if !volumes[v.Name] {
+			_ = d.dc.RemoveVolume(ctx, v.Name)
+		}
+	}
+}
 
 func (d *DockerDriver) logf(spec *Spec, format string, args ...interface{}) {
 	log.Printf("rds %s: %s", spec.Identifier, fmt.Sprintf(format, args...))
@@ -486,11 +562,13 @@ func (d *DockerDriver) Start(spec *Spec) {
 		if b == nil {
 			return
 		}
-		if err := d.dc.Start(context.Background(), b.container); err != nil {
-			// The published port may have been taken meanwhile.
+		if b.container == "" || d.dc.Start(context.Background(), b.container) != nil {
+			// The container is gone (resuming after a restart), or the
+			// published port was taken meanwhile.
 			d.recreate(spec, "starting", "failed")
 			return
 		}
+		_ = d.refreshPort(context.Background(), spec) // unknown after a restart
 		d.ready(spec, "starting", "failed")
 	}()
 }

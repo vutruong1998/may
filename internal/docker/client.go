@@ -270,7 +270,12 @@ func (c *Client) PutArchive(ctx context.Context, id, path string, tarball []byte
 }
 
 func (c *Client) Start(ctx context.Context, id string) error {
-	return c.do(ctx, "POST", "/containers/"+id+"/start", nil, nil, nil)
+	err := c.do(ctx, "POST", "/containers/"+id+"/start", nil, nil, nil)
+	var e *Error
+	if errors.As(err, &e) && e.Status == http.StatusNotModified {
+		return nil // already running
+	}
+	return err
 }
 
 func (c *Client) Stop(ctx context.Context, id string, timeout time.Duration) error {
@@ -303,6 +308,9 @@ func (c *Client) Wait(ctx context.Context, id string) (int, error) {
 
 // Inspect returns the parts of the container state may uses.
 type Inspect struct {
+	Config struct {
+		Env []string
+	}
 	State struct {
 		Status   string
 		Running  bool

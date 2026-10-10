@@ -41,7 +41,30 @@ Any credentials are accepted. The account ID is always `000000000000`.
 | `-region` | `MAY_REGION` | `us-east-1` | Region for resources created by unsigned requests |
 | `-hostname` | `MAY_HOSTNAME` | | Extra hostnames for virtual-host S3 (`bucket.<hostname>`) |
 | `-quiet` | `MAY_QUIET` | off | Don't log each request |
+| `-data-dir` | `MAY_DATA_DIR` | | Keep state in this directory across restarts (see below); in memory only if empty |
 | `-docker` | `MAY_DOCKER` | off | Real mode: run EC2 instances and RDS databases as Docker containers |
+
+### Keeping state across restarts
+
+By default all state is in memory and is gone when may exits. With `-data-dir`, may loads
+its state from the directory on start, saves it every 5 seconds when something changed,
+and again on shutdown (Ctrl-C or SIGTERM):
+
+```bash
+./may -data-dir ./may-data
+docker run -p 4566:4566 -v may-data:/data -e MAY_DATA_DIR=/data maycloud/may
+```
+
+The directory holds one JSON file per service and a `blobs/` folder for S3 object bodies
+(and other values of 32 KB or more). A crash loses at most the last few seconds of changes.
+State changes that were in progress complete on load (a `pending` instance comes back
+`running`, a `creating` DB instance `available`). `POST /_may/reset` also clears the saved
+state. To start over, stop may and delete the directory.
+
+In real mode (`-docker`), containers and volumes are kept too: they are stopped when may
+exits, and on the next start running instances and available databases start again on their
+old containers, with their data. Use the same `-port`, since may finds its containers by a
+label that includes it.
 
 ### Utility endpoints
 
@@ -179,7 +202,7 @@ With `may -docker`, each instance is a container you can use:
   instance data, user data, the identity document and instance-profile credentials, which STS recognizes
   as the assumed role
 - Stop keeps the container's disk; terminate removes it; a container that exits on its own is an
-  instance-initiated shutdown. Containers are removed when may exits.
+  instance-initiated shutdown. Containers are removed when may exits (stopped and kept with `-data-dir`).
 
 ### RDS (API only by default)
 - PostgreSQL (13-17), MySQL (8.0, 8.4) and MariaDB (10.6, 10.11, 11.4); DescribeDBEngineVersions.
@@ -207,12 +230,12 @@ With `may -docker`, each DB instance is a database you can connect to:
 - Parameter group values are passed to the server at start, so changes apply on reboot
   (`ParameterApplyStatus` is `pending-reboot` until then); master password changes take effect at once;
   stop and start keep the data; delete removes the container and its volume. Databases are removed when
-  may exits.
+  may exits (stopped and kept with `-data-dir`).
 
 ## Known gaps
 
 - IAM policies and bucket policies are stored but **never enforced**; SigV4 signatures are not verified.
-- State is in memory only and is lost on restart.
+- State is in memory only and is lost on restart unless `-data-dir` is set.
 - S3 keeps only the latest version of each object (versioning status is stored, but old versions are not).
 - SQS: the 60-second `QueueDeletedRecently` and `PurgeQueueInProgress` limits are not enforced, so tests can
   recreate and purge queues freely. Queue policies are stored, not enforced.
