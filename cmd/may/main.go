@@ -22,6 +22,7 @@ import (
 	"github.com/maycloud/may/internal/dynamodb"
 	"github.com/maycloud/may/internal/ec2"
 	"github.com/maycloud/may/internal/iam"
+	"github.com/maycloud/may/internal/persist"
 	"github.com/maycloud/may/internal/rds"
 	"github.com/maycloud/may/internal/router"
 	"github.com/maycloud/may/internal/s3"
@@ -30,6 +31,9 @@ import (
 )
 
 var version = "0.1.0-dev"
+
+// saveInterval is how often -data-dir state is saved when something changed.
+const saveInterval = 5 * time.Second
 
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -44,6 +48,7 @@ func main() {
 	region := flag.String("region", env("MAY_REGION", "us-east-1"), "default region (env MAY_REGION)")
 	hostnames := flag.String("hostname", env("MAY_HOSTNAME", ""), "extra comma-separated hostnames for virtual-host-style S3 (env MAY_HOSTNAME)")
 	quiet := flag.Bool("quiet", os.Getenv("MAY_QUIET") != "", "don't log each request (env MAY_QUIET)")
+	dataDir := flag.String("data-dir", env("MAY_DATA_DIR", ""), "keep state in this directory across restarts; empty means in memory only (env MAY_DATA_DIR)")
 	useDocker := flag.Bool("docker", os.Getenv("MAY_DOCKER") != "", "run EC2 instances and RDS databases as Docker containers (env MAY_DOCKER)")
 	healthcheck := flag.Bool("healthcheck", false, "query a running server's health endpoint and exit (for Docker HEALTHCHECK)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -70,13 +75,16 @@ func main() {
 	rt.Log = !*quiet
 	rt.Register("iam", iamSvc)
 	rt.Register("sts", stsSvc, sts.Actions...)
-	rt.Register("s3", s3.New(*region, extra...))
+	s3Svc := s3.New(*region, extra...)
+	rt.Register("s3", s3Svc)
 	sqsSvc := sqs.New(*region) // fills sqs.Actions
 	rt.Register("sqs", sqsSvc, sqs.Actions...)
 	rt.Target("AmazonSQS", "sqs")
-	rt.Register("dynamodb", dynamodb.New(*region))
+	ddbSvc := dynamodb.New(*region)
+	rt.Register("dynamodb", ddbSvc)
 	rt.Target("DynamoDB_20120810", "dynamodb")
-	rt.Register("logs", cloudwatch.New(*region))
+	logsSvc := cloudwatch.New(*region)
+	rt.Register("logs", logsSvc)
 	ec2Svc := ec2.New(*region) // fills ec2.Actions
 	ec2Svc.SetIAM(iamSvc)
 	ec2Svc.SetSTS(stsCredentials{stsSvc})
@@ -84,6 +92,30 @@ func main() {
 	rt.Internal("/imds/", http.HandlerFunc(ec2Svc.ServeIMDS))
 	rdsSvc := rds.New(*region, rdsNetwork{ec2Svc}) // fills rds.Actions
 	rt.Register("rds", rdsSvc, rds.Actions...)
+	var store *persist.Store
+	if *dataDir != "" {
+		var err error
+		if store, err = persist.Open(*dataDir); err != nil {
+			log.Fatalf("-data-dir: %v", err)
+		}
+		for _, n := range []struct {
+			name string
+			svc  persist.Service
+		}{{"iam", iamSvc}, {"sts", stsSvc}, {"s3", s3Svc}, {"sqs", sqsSvc}, {"dynamodb", ddbSvc},
+			{"logs", logsSvc}, {"ec2", ec2Svc}, {"rds", rdsSvc}} {
+			store.Add(n.name, n.svc)
+		}
+		loaded, err := store.Load()
+		if err != nil {
+			log.Fatalf("-data-dir: %v (move the file away to start without it)", err)
+		}
+		if len(loaded) > 0 {
+			log.Printf("loaded state from %s (%s)", *dataDir, strings.Join(loaded, ", "))
+		} else {
+			log.Printf("keeping state in %s", *dataDir)
+		}
+		rt.Changed = store.Touch
+	}
 	var dockerDriver *ec2.DockerDriver
 	var rdsDriver *rds.DockerDriver
 	if *useDocker {
@@ -91,20 +123,24 @@ func main() {
 		if err != nil {
 			log.Fatalf("-docker: %v", err)
 		}
-		dockerDriver = ec2.NewDockerDriver(ec2Svc, dc, *port)
+		dockerDriver = ec2.NewDockerDriver(ec2Svc, dc, *port, store != nil)
 		ec2Svc.SetDriver(dockerDriver)
 		log.Printf("EC2 real mode: instances run as containers (Docker API %s, %d CPUs)", dc.Version, dc.NCPU)
 		rt.Internal("/ec2/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(dockerDriver.Endpoints())
 		}))
-		rdsDriver = rds.NewDockerDriver(rdsSvc, dc, *port, *region)
+		rdsDriver = rds.NewDockerDriver(rdsSvc, dc, *port, *region, store != nil)
 		rdsSvc.SetDriver(rdsDriver)
 		log.Printf("RDS real mode: DB instances run as postgres, mysql and mariadb containers")
 		rt.Internal("/rds/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(rdsDriver.Endpoints())
 		}))
+		// Instances and databases loaded from -data-dir get their
+		// containers back.
+		ec2Svc.Resume()
+		rdsSvc.Resume()
 	}
 	rt.Target("Logs_20140328", "logs")
 	rt.Fallback("s3")
@@ -114,18 +150,37 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	shutDown := make(chan struct{})
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdown)
+		close(shutDown)
 	}()
+	if store != nil {
+		go store.Run(ctx, saveInterval)
+	}
 
 	log.Printf("may %s listening on %s (region %s; services: dynamodb, ec2, iam, logs, rds, s3, sqs, sts)", version, addr, *region)
 	err := srv.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		<-shutDown // let requests in progress finish
+		if store != nil {
+			if serr := store.Save(true); serr != nil {
+				log.Printf("saving state: %v", serr)
+			} else {
+				log.Printf("state saved to %s", *dataDir)
+			}
+		}
+	}
 	if dockerDriver != nil {
-		log.Printf("removing instance and database containers")
-		dockerDriver.Close() // instances don't outlive may's in-memory state
+		if store != nil {
+			log.Printf("stopping instance and database containers (kept for the next start)")
+		} else {
+			log.Printf("removing instance and database containers")
+		}
+		dockerDriver.Close() // without -data-dir, instances don't outlive may's in-memory state
 		rdsDriver.Close()
 	}
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {

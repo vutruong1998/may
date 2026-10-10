@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/maycloud/may/internal/docker"
@@ -29,10 +30,15 @@ import (
 //     host.docker.internal, including instance-profile credentials.
 //
 // Stop keeps the container (like an EBS root volume); terminate removes it.
+//
+// With keep (-data-dir), containers and networks outlive may: they are
+// stopped on exit and taken over by Resume on the next start.
 type DockerDriver struct {
 	s       *Service
 	dc      *docker.Client
 	mayPort int
+	keep    bool
+	closing atomic.Bool // set by Close, so watch ignores the exits it causes
 
 	mu       sync.Mutex
 	boxes    map[string]*box   // by instance ID
@@ -57,12 +63,24 @@ const (
 	stopTimeout  = 10 * time.Second
 )
 
-// NewDockerDriver connects to Docker and removes containers and networks
-// left over from an earlier run (may keeps no state across restarts).
-func NewDockerDriver(s *Service, dc *docker.Client, mayPort int) *DockerDriver {
-	d := &DockerDriver{s: s, dc: dc, mayPort: mayPort, boxes: map[string]*box{},
+// NewDockerDriver connects to Docker. Without keep it removes containers
+// and networks left over from an earlier run; with keep it reuses the
+// networks, and Resume takes over the containers.
+func NewDockerDriver(s *Service, dc *docker.Client, mayPort int, keep bool) *DockerDriver {
+	d := &DockerDriver{s: s, dc: dc, mayPort: mayPort, keep: keep, boxes: map[string]*box{},
 		networks: map[string]string{}, pulls: map[string]*sync.Mutex{}}
-	d.cleanup()
+	if !keep {
+		d.cleanup()
+		return d
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	ns, _ := d.dc.Networks(ctx, d.label())
+	for _, n := range ns {
+		if vpc := n.Labels["may.vpc-id"]; vpc != "" {
+			d.networks[vpc] = n.Name
+		}
+	}
 	return d
 }
 
@@ -87,8 +105,63 @@ func (d *DockerDriver) cleanup() {
 
 func (d *DockerDriver) label() string { return managedLabel + "=" + strconv.Itoa(d.mayPort) }
 
-// Close removes all instances' containers and networks (on shutdown).
-func (d *DockerDriver) Close() { d.cleanup() }
+// Close runs on shutdown: it removes all instances' containers and
+// networks, or with keep, stops the containers.
+func (d *DockerDriver) Close() {
+	d.closing.Store(true)
+	if !d.keep {
+		d.cleanup()
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cs, _ := d.dc.Containers(ctx, d.label())
+	var wg sync.WaitGroup
+	for _, c := range cs {
+		if c.State != "running" {
+			continue
+		}
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			_ = d.dc.Stop(ctx, id, stopTimeout)
+		}(c.ID)
+	}
+	wg.Wait()
+}
+
+// Resume takes over the instances loaded from -data-dir: each gets its
+// container back, and those with run set start (with a new container if
+// theirs is gone). Containers of other instances are removed.
+func (d *DockerDriver) Resume(specs []*LaunchSpec, run []bool) {
+	ctx := context.Background()
+	containers := map[string]string{} // instance ID -> container ID
+	cs, err := d.dc.Containers(ctx, d.label())
+	if err != nil {
+		log.Printf("ec2: listing containers to resume: %v", err)
+	}
+	for _, c := range cs {
+		containers[c.Labels["may.instance-id"]] = c.ID
+	}
+	for i, spec := range specs {
+		cid := containers[spec.InstanceID]
+		delete(containers, spec.InstanceID)
+		d.mu.Lock()
+		d.boxes[spec.InstanceID] = &box{spec: spec, container: cid, ports: map[int]int{}}
+		d.mu.Unlock()
+		switch {
+		case !run[i]:
+		case cid == "":
+			d.event(spec.InstanceID, "container from before the restart is gone; creating a new one")
+			go d.boot(spec)
+		default:
+			go d.run(ctx, spec)
+		}
+	}
+	for _, cid := range containers {
+		_ = d.dc.Remove(ctx, cid)
+	}
+}
 
 func (d *DockerDriver) event(id, format string, args ...interface{}) {
 	line := fmt.Sprintf("[may] %s "+format, append([]interface{}{time.Now().UTC().Format("15:04:05")}, args...)...)
@@ -210,8 +283,8 @@ func (d *DockerDriver) refreshPorts(ctx context.Context, id string) {
 func (d *DockerDriver) watch(spec *LaunchSpec, cid string) {
 	for {
 		code, err := d.dc.Wait(context.Background(), cid)
-		if err != nil {
-			return // container removed
+		if err != nil || d.closing.Load() {
+			return // container removed, or stopped because may is exiting
 		}
 		d.mu.Lock()
 		b := d.boxes[spec.InstanceID]

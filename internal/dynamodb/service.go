@@ -104,7 +104,7 @@ type index struct {
 	// Sorted view of the items carrying this index's keys, rebuilt lazily
 	// after writes.
 	version int
-	rows    []Item
+	rows    []Item `persist:"-"`
 }
 
 type throughput struct {
@@ -134,7 +134,7 @@ type table struct {
 	// Items are grouped by partition key; each partition is sorted by the
 	// range key. order caches the partitions sorted for Scan.
 	parts   map[string]*partition
-	order   []*partition
+	order   []*partition `persist:"-"`
 	count   int
 	size    int
 	version int
