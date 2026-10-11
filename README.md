@@ -11,7 +11,7 @@ the Go SDK, Terraform, CDK, Pulumi) can point at it with
 - Starts in tens of milliseconds and idles under 10 MB of memory.
 - Every supported operation is tested with real SDKs; gaps are listed below.
 
-▶️ [Watch the demo](demo.mov)
+![May demo](demo.png)
 
 ## Quick start
 
